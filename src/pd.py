@@ -19,46 +19,11 @@
 ##
 
 import sigrokdecode as srd
-from common.srdhelper import bitpack
-from math import floor, ceil
-
-'''
-OUTPUT_PYTHON format:
-
-Packet:
-[<ptype>, <rxtx>, <pdata>]
-
-This is the list of <ptype>s and their respective <pdata> values:
- - 'STARTBIT': The data is the (integer) value of the start bit (0/1).
- - 'DATA': This is always a tuple containing two items:
-   - 1st item: the (integer) value of the UART data. Valid values
-     range from 0 to 511 (as the data can be up to 9 bits in size).
-   - 2nd item: the list of individual data bits and their ss/es numbers.
- - 'PARITYBIT': The data is the (integer) value of the parity bit (0/1).
- - 'STOPBIT': The data is the (integer) value of the stop bit (0 or 1).
- - 'INVALID STARTBIT': The data is the (integer) value of the start bit (0/1).
- - 'INVALID STOPBIT': The data is the (integer) value of the stop bit (0/1).
- - 'PARITY ERROR': The data is a tuple with two entries. The first one is
-   the expected parity value, the second is the actual parity value.
- - 'BREAK': The data is always 0.
- - 'FRAME': The data is always a tuple containing two items: The (integer)
-   value of the UART data, and a boolean which reflects the validity of the
-   UART frame.
-
-'''
-
-# Given a parity type to check (odd, even, zero, one), the value of the
-# parity bit, the value of the data, and the length of the data (5-9 bits,
-# usually 8 bits) return True if the parity is correct, False otherwise.
-# 'none' is _not_ allowed as value for 'parity_type'.
 
 
-class SamplerateError(Exception):
-    pass
-
-
-class ChannelError(Exception):
-    pass
+ANN_RESET = 0
+ANN_TOUCH = 1
+ANN_DATA = 2
 
 
 class Decoder(srd.Decoder):
@@ -69,75 +34,83 @@ class Decoder(srd.Decoder):
     desc = 'SWD Analyzer'
     license = 'gplv2+'
     inputs = ['swd']
-    outputs = ['swd_analyzer']
-    tags = ['Embedded/industrial']
+    outputs = []
+    tags = ['Debug/trace']
     options = (
+        {'id': 'core', 'desc': 'core type',
+            'default': 'M0', 'values': ('M0', 'M3', 'M4'), 'idn': 'dec_core_type'},
     )
 
     annotations = (
+        ('reset', 'RESET'),
+        ('touch', 'TOUCH'),
+        ('7', 'data', 'DATA'),
     )
 
     annotation_rows = (
+        ('touch', 'Touch', (ANN_TOUCH,)),
+        ('data', 'DATA', (ANN_RESET, ANN_DATA,)),
     )
-
-    # def putx(self, data):
-    #     s, halfbit = self.startsample, self.bit_width / 2.0
-    #     if self.options['anno_startstop'] == 'yes':
-    #         self.put(s - floor(halfbit), self.samplenum +
-    #                  ceil(halfbit), self.out_ann, data)
-    #     else:
-    #         self.put(self.byte_start, self.samplenum + ceil(halfbit *
-    #                  (1+self.options['num_stop_bits'])), self.out_ann, data)
-
-    # def putg(self, data):
-    #     s, halfbit = self.samplenum, self.bit_width / 2.0
-    #     self.put(s - floor(halfbit), s + ceil(halfbit), self.out_ann, data)
-
-    # def putgse(self, ss, es, data):
-    #     self.put(ss, es, self.out_ann, data)
 
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.samplerate = None
-        self.byte_timeout = None
-        self.request_timeout = None
-        self.frame_start = 0
-        self.frame_stop = 0
-        self.frame_valid = None
-        self.request_state = 0
-        self.request_req_start = 0
-        self.request_req_stop = 0
-        self.polling_cycle_start = -1
-        self.polling_cycle_stop = -1
-        self.data_bytes = []
-        self.data_ss = []
-        self.data_es = []
-        self.byte = 0
-        self.ss = 0
-        self.es = 0
+
+        self.touch_ss = None
+        self.touch_es = None
+        self.idcode = None
+        # self.es = 0
+        # self.cnt = 0
 
     def metadata(self, key, value):
         if key == srd.SRD_CONF_SAMPLERATE:
             self.samplerate = value
 
-            self.byte_timeout = ceil(
-                float(self.options['byte_timeout']) /
-                1000_000 * float(self.samplerate)
-            )
-
-            self.request_timeout = ceil(
-                float(self.options['request_timeout']) /
-                1000_000 * float(self.samplerate)
-            )
-
     def start(self):
-        self.out_python = self.register(srd.OUTPUT_PYTHON)
         self.out_ann = self.register(srd.OUTPUT_ANN)
+        # self.out_python = self.register(srd.OUTPUT_PYTHON)
 
     def decode(self, ss, es, data):
-        ptype, rxtx, pdata = data
-        self.ss = ss
+        ptype, pdata = data
+        # self.ss = ss
 
-        raise SamplerateError("unknow devode data type {}".format(ptype))
+        if ptype == 'LINE_RESET':
+
+            if self.touch_ss is None:
+                self.touch_ss = ss
+
+        elif ptype == 'DP_READ':
+
+            if pdata[0] == 0:
+
+                self.idcode = pdata[1]
+                self.status = pdata[2]
+
+                if self.status == 'OK':
+
+                    if (self.touch_ss is not None) and (self.touch_es is None):
+                        self.touch_es = es
+
+                        self.put(self.touch_ss, self.touch_es, self.out_ann,
+                                 [ANN_TOUCH, [
+                                     "TOUCH 0x{:08X} {:f}S".format(
+                                         self.idcode, (self.touch_es-self.touch_ss)/self.samplerate),
+                                 ]])
+
+                    self.put(ss, es, self.out_ann,
+                             [ANN_DATA, [
+                                 "IDCODE 0x{:08X}".format(self.idcode),
+                             ]])
+
+            # else:
+            #     self.put(ss, es, self.out_ann,
+            #              [ANN_DATA, [
+            #                  "{0}".format(data),
+            #              ]])
+
+        # else:
+        #     self.put(ss, es, self.out_ann,
+        #              [ANN_DATA, [
+        #                  "{0}".format(data),
+        #              ]])
